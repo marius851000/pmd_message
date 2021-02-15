@@ -60,7 +60,7 @@ struct MessageBinText {
 #[derive(Debug)]
 pub struct MessageBin {
     /// Contain the messages stored in this file, indexed by the id (an hash)
-    messages: BTreeMap<u32, String>,
+    pub messages: BTreeMap<u32, String>,
 }
 
 impl MessageBin {
