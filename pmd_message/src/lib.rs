@@ -7,8 +7,12 @@ use std::{
     convert::TryInto,
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     num::TryFromIntError,
+    u32,
 };
 use thiserror::Error;
+
+mod bin_database;
+pub use bin_database::{MessageKeyword, MessageKeywordEncodeError};
 
 /// An error that may occur when reading a [`MessageBin`] file via [`MessageBin::load_file`]
 #[derive(Error, Debug)]
@@ -26,8 +30,10 @@ pub enum MessageBinReadError {
 pub enum MessageBinWriteError {
     #[error("an input/output error occured")]
     IOError(#[from] io::Error),
-    #[error("the target file is too big (more that 4^32 bytes)")]
+    #[error("the target file is too big (more that 4^32 bytes) (int conversion failed)")]
     TooBigError(#[from] TryFromIntError),
+    #[error("the target file is too big (more that 4^32 bytes) (overflow)")]
+    Overflow,
     #[error("an error occured writing the sir0 footer")]
     Sir0WriteFooterError(#[from] Sir0WriteFooterError),
 }
@@ -57,16 +63,49 @@ struct MessageBinText {
 /// A structure representing a translation (message) file in 3ds pokemon mystery dungeon games.
 ///
 /// Each text have an associated (32bit, probably crc32) hash associated with them as a key.
-#[derive(Debug)]
+#[derive(Debug, Default)] //TODO: maybe there is a library for this kind of data structure (map sorted with addition order)
 pub struct MessageBin {
-    /// Contain the messages stored in this file, indexed by the id (an hash)
-    pub messages: BTreeMap<u32, String>,
+    /// Contain a reference to the index of an image stored in this file, indexed by the id (an hash)
+    hash_to_id: BTreeMap<u32, usize>,
+    /// Contain the list of message, in the order of the file, with it's hash, an unknown value and content
+    message: Vec<(u32, u32, String)>,
 }
 
 impl MessageBin {
+    /// Return all the hash, the unk value and message content stored in the file
+    pub fn messages(&self) -> &Vec<(u32, u32, String)> {
+        &self.message
+    }
+
+    /// Return the message content with the given hash if it exist.
+    pub fn message_by_hash(&self, hash: u32) -> Option<&String> {
+        match self.hash_to_id.get(&hash) {
+            None => None,
+            Some(key) => Some(&self.message[*key].2),
+        }
+    }
+
+    /// If the hash is already present, update the message content and unknown value, otherwise, add a new message at the end of the messages list.
+    /// Return the old string if it exist.
+    pub fn insert(&mut self, hash: u32, unk: u32, message: String) {
+        match self.hash_to_id.get(&hash) {
+            None => {
+                let position = self.message.len();
+                self.message.push((hash, unk, message));
+                self.hash_to_id.insert(hash, position);
+            }
+            Some(position) => {
+                self.message[*position].1 = unk;
+                self.message[*position].2 = message;
+            }
+        }
+    }
+
     /// Load a MessageBin file from the reader.
     pub fn load_file<T: Read + Seek>(mut file: &mut T) -> Result<Self, MessageBinReadError> {
         file.seek(SeekFrom::Start(0))?;
+        let message_keyword = MessageKeyword::new_default();
+
         // read sir0
         let sir0 = Sir0::new(&mut file)?;
 
@@ -82,48 +121,78 @@ impl MessageBin {
             strings_data.push(file.read_le()?);
         }
 
-        let mut messages = BTreeMap::new();
+        strings_data.sort_unstable_by_key(|e| e.string_pointer);
+
+        let mut message_bin = MessageBin::default();
         for string_data in strings_data {
             file.seek(SeekFrom::Start(string_data.string_pointer as u64))?;
             let text: MessageBinText = file.read_le()?;
-            let text = text.text.to_string();
-            messages.insert(string_data.string_hash, text);
+            let text = message_keyword.decode(&text.text.to_string());
+            message_bin.insert(string_data.string_hash, string_data.unk, text);
         }
 
-        Ok(Self { messages })
+        Ok(message_bin)
     }
 
     // Write a MessageBin to the given writer.
+    //TODO: ugly, rewrite & cleanup
     pub fn write<T: Seek + Write>(&self, file: &mut T) -> Result<(), MessageBinWriteError> {
+        let message_keyword = MessageKeyword::new_default();
         let mut sir0_offsets: Vec<u32> = vec![4, 8];
 
-        file.write_all(&[0; 18])?; //sir0 header and padding
+        file.write_all(&[0; 16])?; //sir0 header and padding
 
         let mut strings_data = Vec::new();
-        for (hash, text) in self.messages.iter() {
-            let mut to_write = text
+        let mut text_current_offset: u32 = 16;
+        for (hash, unk, text) in self.messages().iter() {
+            let mut binary_text_to_write = message_keyword
+                .encode(text)
+                .unwrap() //TODO:
                 .encode_utf16()
                 .flat_map(|v| v.to_le_bytes().to_vec())
                 .collect::<Vec<u8>>();
-            to_write.push(0);
-            to_write.push(0);
+            binary_text_to_write.push(0);
+            binary_text_to_write.push(0);
+            file.write_all(&binary_text_to_write)?;
             strings_data.push(MessageBinStringData {
+                string_pointer: text_current_offset,
                 string_hash: *hash,
-                string_pointer: file.seek(SeekFrom::Current(0))?.try_into()?,
-                unk: 0,
+                unk: *unk,
             });
-            file.write_all(&to_write)?;
+
+            text_current_offset = text_current_offset
+                .checked_add(binary_text_to_write.len().try_into()?)
+                .map_or_else(|| Err(MessageBinWriteError::Overflow), Ok)?;
         }
 
-        let string_meta_position = file.seek(SeekFrom::Current(0))?.try_into()?;
-        sir0_offsets.push(string_meta_position);
+        // padding of 4
+        #[allow(unused_assignments)]
+        if text_current_offset % 4 != 0 {
+            let nb_to_seek = 4 - text_current_offset % 4;
+            file.write_all(&vec![0; nb_to_seek as usize])?;
+            text_current_offset += nb_to_seek;
+        }
+
+        strings_data.sort_unstable_by_key(|e| e.string_hash);
+
+        let string_meta_position: u32 = file.seek(SeekFrom::Current(0))?.try_into()?;
         strings_data.write(file)?; // * macro magic * !!!
         for count in 0..strings_data.len() {
             sir0_offsets.push(string_meta_position + (count as u32) * 12);
         }
 
-        let last_one = sir0_offsets.len() - 1;
-        sir0_offsets[last_one] += 4;
+        let number_of_strings: u32 = strings_data.len().try_into()?;
+        let string_relative_end_offset = number_of_strings
+            .checked_mul(12)
+            .map_or_else(|| Err(MessageBinWriteError::Overflow), Ok)?;
+        let string_absolute_end_offset = string_meta_position
+            .checked_add(string_relative_end_offset)
+            .map_or_else(|| Err(MessageBinWriteError::Overflow), Ok)?;
+        sir0_offsets.push(
+            string_absolute_end_offset
+                .checked_add(4)
+                .map_or_else(|| Err(MessageBinWriteError::Overflow), Ok)?,
+        );
 
         let sir0_header_position = file.seek(SeekFrom::Current(0))?;
         file.write_u32::<LE>(strings_data.len().try_into()?)?;
@@ -131,15 +200,19 @@ impl MessageBin {
 
         let current_position = file.seek(SeekFrom::Current(0))?;
         //TODO: this might need some magic :)
-        if current_position % 32 != 0 {
-            file.write_all(&vec![0; 32 - (current_position as usize % 32)])?;
+        if current_position % 16 != 0 {
+            file.write_all(&vec![0; 16 - (current_position as usize % 16)])?;
         };
 
         let sir0_footer_position = file.seek(SeekFrom::Current(0))?;
 
         write_sir0_footer(file, &sir0_offsets)?;
 
-        file.write_all(&[0; 11])?; //TODO: this doesn't look like a padding ...
+        /*if current_position % 16 != 0 {
+            file.write_all(&vec![0; 16 - (current_position as usize % 16)])?;
+        };*/
+
+        //file.write_all(&[0; 11])?; //TODO: this doesn't look like a padding ...
 
         file.seek(SeekFrom::Start(0))?;
         write_sir0_header(
