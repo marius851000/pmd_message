@@ -10,3 +10,4 @@ edition = "2018"
 clap = "3.0.0-beta.2"
 anyhow = "1.0.0"
 pmd_message = { path = "../pmd_message" }
+pmd_code_table = "0.1.0"

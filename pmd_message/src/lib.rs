@@ -1,6 +1,7 @@
 use binread::{BinRead, BinReaderExt, NullWideString};
 use binwrite::BinWrite;
 use byteorder::{WriteBytesExt, LE};
+use pmd_code_table::{CodeToText, CodeToTextError, TextToCode, TextToCodeError};
 use pmd_sir0::{write_sir0_footer, write_sir0_header, Sir0, Sir0Error, Sir0WriteFooterError};
 use std::{
     collections::BTreeMap,
@@ -11,9 +12,6 @@ use std::{
 };
 use thiserror::Error;
 
-mod bin_database;
-pub use bin_database::{MessageKeyword, MessageKeywordEncodeError};
-
 /// An error that may occur when reading a [`MessageBin`] file via [`MessageBin::load_file`]
 #[derive(Error, Debug)]
 pub enum MessageBinReadError {
@@ -23,6 +21,8 @@ pub enum MessageBinReadError {
     Sir0Error(#[from] Sir0Error),
     #[error("a binread error occured")]
     BinReadError(#[from] binread::Error),
+    #[error("can't decode the string {1:?}")]
+    CantDecodeString(#[source] CodeToTextError, String),
 }
 
 /// An error that may occur when writing a [`MessageBin`] file via [`Messagebin::write`]
@@ -36,6 +36,8 @@ pub enum MessageBinWriteError {
     Overflow,
     #[error("an error occured writing the sir0 footer")]
     Sir0WriteFooterError(#[from] Sir0WriteFooterError),
+    #[error("Can't transform a human text into a encoded string (may be related to invalid label in the source text). Source text : {1:?}")]
+    CantEncodeText(#[source] TextToCodeError, String),
 }
 
 #[derive(BinRead, Debug)]
@@ -102,9 +104,11 @@ impl MessageBin {
     }
 
     /// Load a MessageBin file from the reader.
-    pub fn load_file<T: Read + Seek>(mut file: &mut T) -> Result<Self, MessageBinReadError> {
+    pub fn load_file<T: Read + Seek>(
+        mut file: &mut T,
+        code_to_text: Option<&CodeToText>,
+    ) -> Result<Self, MessageBinReadError> {
         file.seek(SeekFrom::Start(0))?;
-        let message_keyword = MessageKeyword::new_default();
 
         // read sir0
         let sir0 = Sir0::new(&mut file)?;
@@ -127,7 +131,13 @@ impl MessageBin {
         for string_data in strings_data {
             file.seek(SeekFrom::Start(string_data.string_pointer as u64))?;
             let text: MessageBinText = file.read_le()?;
-            let text = message_keyword.decode(&text.text.to_string());
+            let text = if let Some(code_to_text) = code_to_text {
+                code_to_text.decode(&text.text).map_err(|err| {
+                    MessageBinReadError::CantDecodeString(err, text.text.to_string())
+                })?
+            } else {
+                text.text.to_string()
+            };
             message_bin.insert(string_data.string_hash, string_data.unk, text);
         }
 
@@ -136,8 +146,11 @@ impl MessageBin {
 
     // Write a MessageBin to the given writer.
     //TODO: ugly, rewrite & cleanup
-    pub fn write<T: Seek + Write>(&self, file: &mut T) -> Result<(), MessageBinWriteError> {
-        let message_keyword = MessageKeyword::new_default();
+    pub fn write<T: Seek + Write>(
+        &self,
+        file: &mut T,
+        text_to_code: Option<&TextToCode>,
+    ) -> Result<(), MessageBinWriteError> {
         let mut sir0_offsets: Vec<u32> = vec![4, 8];
 
         file.write_all(&[0; 16])?; //sir0 header and padding
@@ -145,10 +158,15 @@ impl MessageBin {
         let mut strings_data = Vec::new();
         let mut text_current_offset: u32 = 16;
         for (hash, unk, text) in self.messages().iter() {
-            let mut binary_text_to_write = message_keyword
-                .encode(text)
-                .unwrap() //TODO:
-                .encode_utf16()
+            let text_to_write = if let Some(text_to_code) = text_to_code {
+                text_to_code
+                    .encode(text)
+                    .map_err(|err| MessageBinWriteError::CantEncodeText(err, text.to_string()))?
+            } else {
+                text.encode_utf16().collect()
+            };
+            let mut binary_text_to_write = text_to_write
+                .iter()
                 .flat_map(|v| v.to_le_bytes().to_vec())
                 .collect::<Vec<u8>>();
             binary_text_to_write.push(0);
