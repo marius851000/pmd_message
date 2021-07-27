@@ -1,6 +1,6 @@
 [package]
 name = "pmd_message"
-version = "1.0.2"
+version = "2.0.0"
 authors = ["marius david <mariusdavid@laposte.net>"]
 edition = "2018"
 description = "A library that can read message*.bin files, used in 3ds pokemon mystery dungeon games"
@@ -12,8 +12,8 @@ license = "CC0-1.0"
 
 [dependencies]
 thiserror = "1.0.23"
-binread = "1.4.1"
+binread = "2.1.1"
 pmd_sir0 = "1.2.1"
 binwrite = "0.2.1"
-byteorder = "1.4.2"
+byteorder = "1.4.3"
 pmd_code_table = "0.1.0"
